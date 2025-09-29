@@ -23,7 +23,7 @@ prompts=(
 # ============ Loop ============
 i=1
 for prompt in "${prompts[@]}"; do
-  python run_flux_kontext_v05.py \
+  python run_flux_kontext.py \
     --offload --no_xformers \
     --gpu_abs 2 --gpu 0 \
     --steps 2 \
