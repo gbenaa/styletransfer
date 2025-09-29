@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-# FLUX.1-Kontext single-GPU runner (rectangular outputs supported) — v05
-# Changes in v05:
-#   = Added --out_dir, --name_template, --prompt_index, --manifest
-#   = Centralised filename generation (slug from prompt), writes manifest CSV
-#   = If --out is provided, it takes precedence (back-compat)
-#   = No changes to inference path, dtype, memory knobs, or sizing logic
+# FLUX.1-Kontext single-GPU runner (rectangular outputs supported)
+# Additions:
+#  - Per-step saving via callbacks:
+#      --save_all_steps
+#      --callback_interval
+#      --step_name_template
+#      --perstep_manifest
+#  - (Existing) centralised filename templating + manifest logging
 
 import os
 import argparse
@@ -60,6 +62,17 @@ def parse_args():
     p.add_argument("--post_brightness", type=float, default=1.0)
     p.add_argument("--post_contrast", type=float, default=1.0)
     p.add_argument("--post_gamma", type=float, default=1.0)
+
+    # ---- Per-step saving controls ----
+    p.add_argument("--save_all_steps", action="store_true",
+                   help="Save an image for every diffusion step (or each --callback_interval step).")
+    p.add_argument("--callback_interval", type=int, default=1,
+                   help="Save every Nth step when --save_all_steps is used.")
+    p.add_argument("--step_name_template", type=str,
+                   default="{stem}_s{steps}_g{guidance}_seed{seed}_p{index:02d}_{slug}_step{step:03d}.png",
+                   help="Filename template for per-step frames.")
+    p.add_argument("--perstep_manifest", type=str, default=None,
+                   help="Optional CSV manifest for per-step frames.")
 
     return p.parse_args()
 
@@ -137,33 +150,53 @@ def slugify(text: str, max_len: int = 60) -> str:
     return slug[:max_len] or "prompt"
 
 
-def ensure_manifest_header(path: Path):
+def ensure_manifest_header(path: Path, per_step: bool = False):
     if not path.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("w", encoding="utf-8") as f:
-            f.write("index,filename,prompt,seed,steps,guidance,width,height,model,neg,image\n")
+            if per_step:
+                f.write("index,step,timestep,filename,prompt,seed,steps,guidance,width,height,model,neg,image\n")
+            else:
+                f.write("index,filename,prompt,seed,steps,guidance,width,height,model,neg,image\n")
 
 
-def append_manifest(path: Path, row: dict):
+def append_manifest(path: Path, row: dict, per_step: bool = False):
     import csv
     path.parent.mkdir(parents=True, exist_ok=True)
     if not path.exists():
-        ensure_manifest_header(path)
+        ensure_manifest_header(path, per_step=per_step)
     with path.open("a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow([
-            row.get("index", ""),
-            row.get("filename", ""),
-            row.get("prompt", ""),
-            row.get("seed", ""),
-            row.get("steps", ""),
-            row.get("guidance", ""),
-            row.get("width", ""),
-            row.get("height", ""),
-            row.get("model", ""),
-            row.get("neg", ""),
-            row.get("image", ""),
-        ])
+        if per_step:
+            w.writerow([
+                row.get("index", ""),
+                row.get("step", ""),
+                row.get("timestep", ""),
+                row.get("filename", ""),
+                row.get("prompt", ""),
+                row.get("seed", ""),
+                row.get("steps", ""),
+                row.get("guidance", ""),
+                row.get("width", ""),
+                row.get("height", ""),
+                row.get("model", ""),
+                row.get("neg", ""),
+                row.get("image", ""),
+            ])
+        else:
+            w.writerow([
+                row.get("index", ""),
+                row.get("filename", ""),
+                row.get("prompt", ""),
+                row.get("seed", ""),
+                row.get("steps", ""),
+                row.get("guidance", ""),
+                row.get("width", ""),
+                row.get("height", ""),
+                row.get("model", ""),
+                row.get("neg", ""),
+                row.get("image", ""),
+            ])
 
 
 # =========================
@@ -229,7 +262,110 @@ def main():
         print(f"-> Using original input size: {orig_w}x{orig_h}")
         target_w, target_h = img.size  # -> use whatever we feed to the model
 
-    # -> Generate (rectangular height/width passed through if honoured by pipeline)
+    # ---------- Per-step callback wiring ----------
+    # Build common naming parts
+    stem = Path(args.image).stem
+    slug = slugify(args.prompt)
+    seed_str = str(args.seed) if args.seed is not None else "rand"
+
+    # Helper: save a tensor latents -> PIL -> file (handles decoding)
+    def _save_step_image(latents_tensor, step: int, timestep: int):
+        # Decode latents to image using the pipeline VAE; fall back gracefully.
+        try:
+            with torch.no_grad():
+                # Many pipelines expose latents in [-?], need scaling factor
+                scaling = getattr(pipe.vae, "scaling_factor", 0.18215)
+                lat = latents_tensor
+                if lat.device.type != device.type:
+                    lat = lat.to(device)
+                lat = lat / scaling
+                image = pipe.vae.decode(lat).sample  # [B,C,H,W], float32
+                # Map to [0,1] and to PIL via image_processor
+                image = (image / 2 + 0.5).clamp(0, 1)
+                pil_list = pipe.image_processor.postprocess(image, output_type="pil")
+                pil = pil_list[0]
+        except Exception as e:
+            print(f"-> Step decode failed (step={step}, timestep={timestep}): {e}")
+            return None
+
+        # Construct filename from template
+        fname = args.step_name_template.format(
+            stem=stem,
+            steps=args.steps,
+            guidance=args.guidance,
+            seed=seed_str,
+            index=args.prompt_index,
+            slug=slug,
+            w=target_w,
+            h=target_h,
+            model=Path(args.model).name,
+            step=step,
+            timestep=timestep,
+        )
+        out_path = Path(args.out_dir) / fname
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Atomic-ish save
+        tmp = out_path.with_suffix(out_path.suffix + ".tmp")
+        try:
+            pil.save(str(tmp))
+            tmp.replace(out_path)
+            if args.perstep_manifest:
+                append_manifest(
+                    Path(args.perstep_manifest),
+                    {
+                        "index": args.prompt_index,
+                        "step": step,
+                        "timestep": timestep,
+                        "filename": str(out_path),
+                        "prompt": args.prompt,
+                        "seed": args.seed if args.seed is not None else "",
+                        "steps": args.steps,
+                        "guidance": args.guidance,
+                        "width": target_w,
+                        "height": target_h,
+                        "model": args.model,
+                        "neg": args.negative_prompt or "",
+                        "image": args.image,
+                    },
+                    per_step=True,
+                )
+        except Exception as e:
+            print(f"-> Failed to save step image {out_path.name}: {e}")
+            return None
+
+        print(f"-> Saved step {step:03d} (t={timestep}) to: {out_path}")
+        return out_path
+
+    # Old-style callback(step, timestep, latents)
+    def _legacy_cb(step: int, timestep: int, latents):
+        if not args.save_all_steps:
+            return
+        if args.callback_interval > 1 and (step % args.callback_interval) != 0:
+            return
+        # latents expected shape [B, C, H, W]
+        if latents is None:
+            return
+        _save_step_image(latents, step, timestep)
+
+    # New-style callback_on_step_end with tensor inputs dict
+    def _modern_cb(pipe, step: int, timestep: int, callback_kwargs):
+        # callback_kwargs typically contains "latents"
+        if not args.save_all_steps:
+            return callback_kwargs
+        if args.callback_interval > 1 and (step % args.callback_interval) != 0:
+            return callback_kwargs
+        latents = callback_kwargs.get("latents", None)
+        if latents is not None:
+            _save_step_image(latents, step, timestep)
+        return callback_kwargs
+
+    # Decide which callback API to use at runtime
+    use_modern = hasattr(pipe, "set_progress_bar_config") and \
+                 ("callback_on_step_end" in pipe.__call__.__code__.co_varnames or
+                  "callback_on_step_end" in getattr(pipe.__call__, "__annotations__", {}))
+
+    # -> Generate (height/width passed through if honoured by pipeline)
     print("-> Running edit …")
     call_kwargs = dict(
         image=img,
@@ -241,6 +377,18 @@ def main():
         height=target_h,
         width=target_w,
     )
+
+    # Wire callbacks if requested
+    if args.save_all_steps:
+        if use_modern:
+            # Newer diffusers: callback_on_step_end and select tensors to receive
+            call_kwargs["callback_on_step_end"] = _modern_cb
+            call_kwargs["callback_on_step_end_tensor_inputs"] = ["latents"]
+            print("-> Per-step saving enabled (modern callback).")
+        else:
+            call_kwargs["callback"] = _legacy_cb
+            call_kwargs["callback_steps"] = max(1, args.callback_interval)
+            print("-> Per-step saving enabled (legacy callback).")
 
     with torch.inference_mode():
         result = pipe(**call_kwargs).images[0]
@@ -266,15 +414,11 @@ def main():
         )
 
     # =========================
-    # = Output path resolution
+    # = Output path resolution (final frame)
     # =========================
-    # -> If --out is explicitly given, it wins (back-compat). Otherwise build name from template.
     if args.out and args.out.strip() and args.out != "output.png":
         out_path = Path(args.out)
     else:
-        stem = Path(args.image).stem
-        slug = slugify(args.prompt)
-        seed_str = str(args.seed) if args.seed is not None else "rand"
         fname = args.name_template.format(
             stem=stem,
             steps=args.steps,
@@ -293,7 +437,7 @@ def main():
     print(f"-> Saved: {out_path.resolve()}")
 
     # =========================
-    # = Manifest append
+    # = Manifest append (final frame)
     # =========================
     append_manifest(
         Path(args.manifest),
@@ -310,6 +454,7 @@ def main():
             "neg": args.negative_prompt or "",
             "image": args.image,
         },
+        per_step=False,
     )
 
 
